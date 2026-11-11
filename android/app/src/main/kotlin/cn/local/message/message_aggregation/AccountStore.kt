@@ -35,6 +35,13 @@ class AccountStore(context: Context) {
         }
         return String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
     }
+    fun metadata(): List<MailAccount> {
+        val data = JSONArray(prefs.getString("accounts", "[]"))
+        return (0 until data.length()).map {
+            val a = data.getJSONObject(it)
+            MailAccount(a.getString("id"), a.getString("provider"), a.getString("address"), "")
+        }
+    }
     fun accounts(): List<MailAccount> {
         val data = JSONArray(prefs.getString("accounts", "[]"))
         return (0 until data.length()).map {

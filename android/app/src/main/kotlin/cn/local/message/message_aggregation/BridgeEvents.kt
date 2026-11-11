@@ -7,5 +7,10 @@ import io.flutter.plugin.common.EventChannel
 object BridgeEvents {
     var sink: EventChannel.EventSink? = null
     private val main = Handler(Looper.getMainLooper())
-    fun changed() { main.post { sink?.success(true) } }
+    private val emit = Runnable { sink?.success(true) }
+    fun changed() { main.post {
+        // Batch a burst of persisted notifications into one platform-channel reload.
+        main.removeCallbacks(emit)
+        main.postDelayed(emit, 100)
+    } }
 }

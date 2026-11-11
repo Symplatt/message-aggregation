@@ -31,6 +31,8 @@ class FakeGateway implements AggregationGateway {
     row('c', 'sms', archived: true),
   ];
   bool failWrites = false;
+  bool failNextWrite = false;
+  Completer<void>? delayedWrite;
   @override
   Stream<void> get changes => const Stream.empty();
   @override
@@ -43,11 +45,30 @@ class FakeGateway implements AggregationGateway {
     String method, [
     Map<String, dynamic>? arguments,
   ]) async {
-    if (method == 'updateMessage') {
-      if (failWrites) throw PlatformException(code: 'disk', message: '无法保存');
-      final target = data.firstWhere((m) => m['id'] == arguments!['id']);
-      for (final field in ['isRead', 'archived']) {
-        if (arguments![field] != null) target[field] = arguments[field];
+    if (method == 'pinMessage') {
+      final selected = data.firstWhere((m) => m['id'] == arguments!['id']);
+      for (final target in data.where(
+        (m) =>
+            m['source'] == selected['source'] &&
+            m['title'] == selected['title'],
+      )) {
+        target['isPinned'] = arguments!['pinned'];
+      }
+    }
+    if (method == 'deleteMessages') {
+      data.removeWhere((m) => (arguments!['ids'] as List).contains(m['id']));
+    }
+    if (method == 'updateMessage' || method == 'updateMessages') {
+      if (failWrites || failNextWrite) {
+        failNextWrite = false;
+        throw PlatformException(code: 'disk', message: '无法保存');
+      }
+      await delayedWrite?.future;
+      final ids = arguments!['ids'] as List? ?? [arguments['id']];
+      for (final target in data.where((m) => ids.contains(m['id']))) {
+        for (final field in ['isRead', 'archived']) {
+          if (arguments[field] != null) target[field] = arguments[field];
+        }
       }
     }
     return null;
@@ -101,22 +122,52 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(412, 915));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    final controller = InboxController(FakeGateway());
+    final gateway = FakeGateway();
+    gateway.data.add({
+      ...row('history', 'wechat'),
+      'title': '项目进度',
+      'body': '先前讨论\n${List.filled(30, '历史消息').join('\n')}',
+    });
+    expect(
+      collapseConversations([
+        InboxMessage.fromMap({...row('q1', 'qq'), 'title': '测试群'}),
+        InboxMessage.fromMap({...row('q2', 'qq'), 'title': '测试群(2条新消息)'}),
+      ]),
+      hasLength(1),
+    );
+    final controller = InboxController(gateway);
     await tester.pumpWidget(AggregationApp(controller: controller));
     await tester.pumpAndSettle();
     expect(find.text('项目进度'), findsOneWidget);
     await tester.tap(find.byTooltip('搜索消息'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byType(TextField), '项目');
+    // Matching history still shows one card with the latest summary.
+    await tester.enterText(find.byType(TextField), '先前讨论');
     await tester.pumpAndSettle();
     expect(find.text('下午会议'), findsNothing);
+    expect(find.text('项目进度'), findsOneWidget);
     await tester.tap(find.byTooltip('清除搜索'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('项目进度'));
     await tester.pumpAndSettle();
+    final action = find.widgetWithText(FilledButton, '标为已读');
+    final footerBefore = tester.getRect(action);
+    await tester.drag(
+      find.byType(SingleChildScrollView).last,
+      const Offset(0, -450),
+    );
+    await tester.pumpAndSettle();
+    expect(tester.getRect(action), footerBefore);
+    expect(footerBefore.bottom, lessThanOrEqualTo(915));
     await tester.tap(find.widgetWithText(FilledButton, '标为已读'));
     await tester.pumpAndSettle();
     expect(controller.messages.first.isRead, isTrue);
+    expect(
+      controller.messages
+          .where((m) => m.source == MessageSource.wechat)
+          .every((m) => m.isRead),
+      isTrue,
+    );
     await tester.tapAt(const Offset(10, 10));
     await tester.pumpAndSettle();
     await tester.tap(find.text('项目进度'));
@@ -126,7 +177,47 @@ void main() {
     await tester.tapAt(const Offset(10, 10));
     await tester.pumpAndSettle();
     expect(controller.messages.first.isRead, isFalse);
+
+    // A failed manual save must not suppress automatic read on dismissal.
+    await tester.tap(find.text('项目进度'));
+    await tester.pumpAndSettle();
+    gateway.failNextWrite = true;
+    await tester.tap(find.widgetWithText(FilledButton, '标为已读'));
+    await tester.pumpAndSettle();
+    expect(controller.messages.first.isRead, isFalse);
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+    expect(controller.messages.first.isRead, isTrue);
+
+    // Closing while a successful manual-unread save is pending must retain that choice.
+    await tester.tap(find.text('项目进度'));
+    await tester.pumpAndSettle();
+    final pending = Completer<void>();
+    gateway.delayedWrite = pending;
+    await tester.tap(find.widgetWithText(FilledButton, '标为未读'));
+    await tester.pump();
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+    pending.complete();
+    gateway.delayedWrite = null;
+    await tester.pumpAndSettle();
+    expect(controller.messages.first.isRead, isFalse);
     expect(tester.takeException(), isNull);
+    await tester.tap(find.byTooltip('消息操作').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('置顶'));
+    await tester.pumpAndSettle();
+    expect(controller.conversations.first.isPinned, isTrue);
+    await controller.reload();
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.push_pin_rounded), findsOneWidget);
+    await tester.drag(find.text('项目进度'), const Offset(-350, 0));
+    await tester.pumpAndSettle();
+    expect(find.text('项目进度'), findsNothing);
+    expect(
+      controller.messages.where((m) => m.source == MessageSource.wechat),
+      isEmpty,
+    );
   });
 
   testWidgets(

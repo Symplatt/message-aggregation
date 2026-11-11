@@ -1,13 +1,19 @@
 package cn.local.message.message_aggregation
 
 import android.Manifest
+import android.app.ActivityOptions
+import android.app.NotificationChannel
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.app.NotificationManager
-import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
 import android.provider.Telephony
+import android.util.Log
 import androidx.work.*
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -19,6 +25,36 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : FlutterActivity() {
     private val executor = Executors.newSingleThreadExecutor()
+    private val networkExecutor = Executors.newSingleThreadExecutor()
+    private val connectionHandler = Handler(Looper.getMainLooper())
+    private val checkConnection = object : Runnable {
+        override fun run() {
+            ListenerConnection.ensure(this@MainActivity)
+            connectionHandler.postDelayed(this, 30000)
+        }
+    }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel("messages", "消息通知", NotificationManager.IMPORTANCE_DEFAULT))
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        if (Build.VERSION.SDK_INT >= 33 && !prefs.getBoolean("notificationPermissionRequested", false)) {
+            prefs.edit().putBoolean("notificationPermissionRequested", true).apply()
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 72)
+        }
+    }
+    override fun onResume() {
+        super.onResume()
+        connectionHandler.removeCallbacks(checkConnection)
+        checkConnection.run()
+        ListenerConnection.schedule(this)
+        scheduleSms()
+        CollectionService.update(this)
+    }
+    override fun onPause() {
+        connectionHandler.removeCallbacks(checkConnection)
+        super.onPause()
+    }
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, "message_aggregation/events")
@@ -29,16 +65,17 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "message_aggregation/native")
             .setMethodCallHandler { call, result -> handle(call, result) }
     }
-    override fun onDestroy() { BridgeEvents.sink = null; executor.shutdown(); super.onDestroy() }
+    override fun onDestroy() { BridgeEvents.sink = null; executor.shutdown(); networkExecutor.shutdown(); super.onDestroy() }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 71) {
             scheduleSms()
+            CollectionService.update(this)
             executor.execute { runCatching { SmsSync.collect(this) }; BridgeEvents.changed() }
         }
     }
-    private fun background(result: MethodChannel.Result, action: () -> Any?) {
-        executor.execute {
+    private fun background(result: MethodChannel.Result, network: Boolean = false, action: () -> Any?) {
+        (if (network) networkExecutor else executor).execute {
             try { val value = action(); runOnUiThread { result.success(value) } }
             catch (e: Exception) {
                 val message = when (e) {
@@ -54,12 +91,32 @@ class MainActivity : FlutterActivity() {
         try {
             when (call.method) {
                 "load" -> background(result) {
-                    SmsSync.collect(this)
                     mapOf("messages" to MessageDatabase.get(this).list(), "status" to status(), "icons" to sourceIcons())
                 }
                 "status" -> background(result) { status() }
                 "updateMessage" -> background(result) {
                     MessageDatabase.get(this).update(requireNotNull(call.argument<String>("id")), call.argument("isRead"), call.argument("archived"))
+                    null
+                }
+                "updateMessages" -> background(result) {
+                    val ids = requireNotNull(call.argument<List<String>>("ids"))
+                    require(ids.isNotEmpty())
+                    MessageDatabase.get(this).updateMessages(ids, call.argument("isRead"), call.argument("archived"))
+                    null
+                }
+                "markAllRead" -> background(result) {
+                    val source = call.argument<String>("source")
+                    require(source == null || source in listOf("wechat", "qq", "sms", "qqmail", "netease", "gmail"))
+                    MessageDatabase.get(this).markAllRead(source)
+                }
+                "pinMessage" -> background(result) {
+                    MessageDatabase.get(this).setPinned(requireNotNull(call.argument<String>("id")), call.argument<Boolean>("pinned") == true)
+                    null
+                }
+                "deleteMessages" -> background(result) {
+                    val ids = requireNotNull(call.argument<List<String>>("ids"))
+                    require(ids.isNotEmpty())
+                    MessageDatabase.get(this).deleteMessages(ids)
                     null
                 }
                 "notificationSettings" -> {
@@ -77,10 +134,11 @@ class MainActivity : FlutterActivity() {
                     val source = requireNotNull(call.argument<String>("source"))
                     require(source in listOf("wechat", "qq", "sms"))
                     getSharedPreferences("settings", MODE_PRIVATE).edit().putBoolean(source, call.argument<Boolean>("enabled") == true).apply()
-                    scheduleSms(); result.success(null)
+                    scheduleSms(); ListenerConnection.schedule(this); ListenerConnection.ensure(this)
+                    CollectionService.update(this); result.success(null)
                 }
-                "sync" -> background(result) { SmsSync.collect(this); MailSync.syncAll(this) }
-                "saveAccount" -> background(result) {
+                "sync" -> background(result, network = true) { SmsSync.collect(this); MailSync.syncAll(this) }
+                "saveAccount" -> background(result, network = true) {
                     synchronized(MailSync.lock) {
                         val address = requireNotNull(call.argument<String>("address")).trim().lowercase()
                         val provider = requireNotNull(call.argument<String>("provider"))
@@ -96,7 +154,7 @@ class MainActivity : FlutterActivity() {
                         null
                     }
                 }
-                "removeAccount" -> background(result) {
+                "removeAccount" -> background(result, network = true) {
                     synchronized(MailSync.lock) {
                         val id = requireNotNull(call.argument<String>("id"))
                         AccountStore(this).remove(id)
@@ -152,13 +210,10 @@ class MainActivity : FlutterActivity() {
     private fun status(): Map<String, Any> {
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
         val sync = getSharedPreferences("mail_sync", MODE_PRIVATE)
-        val manager = getSystemService(NotificationManager::class.java)
-        val allowed = if (android.os.Build.VERSION.SDK_INT >= 27)
-            manager.isNotificationListenerAccessGranted(ComponentName(this, MessageNotificationListener::class.java))
-            else Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-                ?.split(':')?.contains(ComponentName(this, MessageNotificationListener::class.java).flattenToString()) == true
-        val accounts = synchronized(MailSync.lock) {
-            AccountStore(this).accounts().map { a ->
+        val allowed = ListenerConnection.allowed(this)
+        val accounts = run {
+            // Display metadata never waits for network synchronization or decrypts credentials.
+            AccountStore(this).metadata().map { a ->
                 mapOf("id" to a.id, "provider" to a.provider, "address" to a.address,
                     "lastSync" to sync.getLong(a.id + "_success", 0), "error" to sync.getString(a.id + "_error", "").orEmpty())
             }
@@ -176,7 +231,20 @@ class MainActivity : FlutterActivity() {
         val target = call.argument<String>("target").orEmpty()
         if (source in listOf("wechat", "qq")) {
             MessageNotificationListener.actions[target]?.let {
-                try { it.send(); return "已打开原通知对应页面" } catch (_: Exception) { }
+                // Android 14+ requires sender opt-in to lend the visible activity's launch privileges.
+                // Service/broadcast notification trampolines cannot open an activity reliably; use the launcher below.
+                if (it.isActivity) {
+                    try {
+                        val options = ActivityOptions.makeBasic()
+                        if (Build.VERSION.SDK_INT >= 36) {
+                            options.setPendingIntentBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE)
+                        } else if (Build.VERSION.SDK_INT >= 34) {
+                            options.setPendingIntentBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED)
+                        }
+                        it.send(this, 0, null, null, null, null, options.toBundle())
+                        return "已请求打开原通知对应页面"
+                    } catch (_: Exception) { }
+                }
             }
         }
         if (source == "sms") {

@@ -36,6 +36,7 @@ class InboxController extends ChangeNotifier {
   StreamSubscription<void>? _events;
   bool _disposed = false, _reloadAgain = false;
   int get unreadCount => messages.where((m) => !m.isRead).length;
+  List<InboxMessage> get conversations => collapseConversations(messages);
 
   void start() {
     _events = gateway.changes.listen(
@@ -102,19 +103,46 @@ class InboxController extends ChangeNotifier {
     bool? isRead,
     bool? archived,
   }) async {
-    await gateway.invoke('updateMessage', {
+    final ids = message.entries.map((m) => m.id).toSet();
+    await gateway.invoke(ids.length == 1 ? 'updateMessage' : 'updateMessages', {
       'id': message.id,
+      if (ids.length > 1) 'ids': ids.toList(),
       'isRead': isRead,
       'archived': archived,
     });
     // Only change the UI after the durable write succeeds.
     messages = messages
         .map(
-          (m) => m.id == message.id
+          (m) => ids.contains(m.id)
               ? m.copyWith(isRead: isRead, archived: archived)
               : m,
         )
         .toList();
+    _notify();
+  }
+
+  Future<void> markAllRead(MessageSource? source) async {
+    await gateway.invoke('markAllRead', {'source': source?.name});
+    await reload();
+  }
+
+  Future<void> setPinned(InboxMessage message) async {
+    final pinned = !message.isPinned;
+    await gateway.invoke('pinMessage', {'id': message.id, 'pinned': pinned});
+    messages = messages
+        .map(
+          (m) => m.conversationKey == message.conversationKey
+              ? m.copyWith(isPinned: pinned)
+              : m,
+        )
+        .toList();
+    _notify();
+  }
+
+  Future<void> delete(InboxMessage message) async {
+    final ids = message.entries.map((m) => m.id).toSet();
+    await gateway.invoke('deleteMessages', {'ids': ids.toList()});
+    messages = messages.where((m) => !ids.contains(m.id)).toList();
     _notify();
   }
 

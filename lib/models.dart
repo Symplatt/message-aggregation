@@ -21,11 +21,25 @@ class InboxMessage {
     this.isRead = false,
     this.archived = false,
     this.target = '',
+    this.history = const [],
+    this.isPinned = false,
   });
   final String id, title, body, sender, target;
   final MessageSource source;
   final DateTime receivedAt;
-  final bool isRead, archived;
+  final bool isRead, archived, isPinned;
+  // Presentation-only grouping; individual persisted messages retain their IDs and local state.
+  final List<InboxMessage> history;
+  bool get isChat =>
+      source == MessageSource.wechat || source == MessageSource.qq;
+  String get conversationTitle => source == MessageSource.qq
+      ? title.replaceFirst(RegExp(r'\s*[（(]\d+条(?:新)?消息[）)]$'), '').trim()
+      : title.trim();
+  String get conversationKey =>
+      isChat && conversationTitle.isNotEmpty && conversationTitle != '新消息'
+      ? '${source.name}\u0000$conversationTitle'
+      : '${source.name}\u0000$id';
+  Iterable<InboxMessage> get entries => history.isEmpty ? [this] : history;
 
   factory InboxMessage.fromMap(Map<dynamic, dynamic> map) => InboxMessage(
     id: map['id'] as String,
@@ -37,9 +51,15 @@ class InboxMessage {
     receivedAt: DateTime.fromMillisecondsSinceEpoch(map['receivedAt'] as int),
     isRead: map['isRead'] == true,
     archived: map['archived'] == true,
+    isPinned: map['isPinned'] == true,
   );
 
-  InboxMessage copyWith({bool? isRead, bool? archived}) => InboxMessage(
+  InboxMessage copyWith({
+    bool? isRead,
+    bool? archived,
+    bool? isPinned,
+    List<InboxMessage>? history,
+  }) => InboxMessage(
     id: id,
     source: source,
     title: title,
@@ -49,7 +69,29 @@ class InboxMessage {
     target: target,
     isRead: isRead ?? this.isRead,
     archived: archived ?? this.archived,
+    isPinned: isPinned ?? this.isPinned,
+    history: history ?? this.history,
   );
+}
+
+List<InboxMessage> collapseConversations(Iterable<InboxMessage> messages) {
+  final sorted = messages.toList()
+    ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+  final groups = <String, List<InboxMessage>>{};
+  for (final message in sorted) {
+    groups.putIfAbsent(message.conversationKey, () => []).add(message);
+  }
+  return groups.values
+      .map(
+        (entries) => entries.length == 1
+            ? entries.first
+            : entries.first.copyWith(
+                isRead: entries.every((m) => m.isRead),
+                isPinned: entries.any((m) => m.isPinned),
+                history: List.unmodifiable(entries),
+              ),
+      )
+      .toList();
 }
 
 List<InboxMessage> filterMessages(
@@ -63,21 +105,22 @@ List<InboxMessage> filterMessages(
       .trim()
       .toLowerCase()
       .split(RegExp(r'\s+'))
-      .where((w) => w.isNotEmpty);
-  return messages
-      .where(
-        (m) =>
-            (archived == null || m.archived == archived) &&
-            (source == null || source == m.source) &&
-            (!unreadOnly || !m.isRead) &&
-            words.every(
-              (w) => '${m.title} ${m.body} ${m.sender} ${m.source.label}'
-                  .toLowerCase()
-                  .contains(w),
-            ),
-      )
-      .toList()
-    ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+      .where((w) => w.isNotEmpty)
+      .toList();
+  return messages.where((m) {
+    if ((archived != null && m.archived != archived) ||
+        (source != null && source != m.source) ||
+        (unreadOnly && m.isRead))
+      return false;
+    if (words.isEmpty) return true;
+    final text =
+        '${m.title} ${m.entries.map((e) => '${e.body} ${e.sender}').join(' ')} ${m.source.label}'
+            .toLowerCase();
+    return words.every(text.contains);
+  }).toList()..sort((a, b) {
+    if (a.isPinned != b.isPinned) return a.isPinned ? -1 : 1;
+    return b.receivedAt.compareTo(a.receivedAt);
+  });
 }
 
 class MailAccount {
