@@ -245,5 +245,4 @@ SHA-256：`D764615974340F4B0F3627DC8AE9CBDF8D684659CC041A7F09A0E4838594ED55`。
 - 已装正式 ARM64 包 SHA-256 为 331D8D05122C4790E3917DEC596F8AAE667B9AC61FDA46169443668F53129142，与本地正式包一致。
 - 正式安装后 19:25:13 释放失效监听绑定，19:25:14 Listener connected，保留授权；接入页微信和 QQ 均显示监听中。
 - 实际截图 build/mail-1.0.0-release.png。长期后台稳定性、真实新消息接收及本轮邮箱真实登录失败场景未验证。
-- 正在提交、推送、创建 v1.0.0 和 GitHub Release 并核验远程资产。
-
+- 发布已完成，源码提交 d0aefb9 已推送，v1.0.0 指向该提交，GitHub Release 三份 APK 的远程 SHA-256 与本地包一致，Release 文案与 CHANGELOG 一致。
