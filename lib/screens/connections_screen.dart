@@ -1,8 +1,29 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../aggregation_service.dart';
 import '../models.dart';
 import '../widgets/source_icon.dart';
+
+Future<void> showMailFailureDetails(BuildContext context, String details) =>
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('连接失败详情'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            details.isEmpty ? '上次失败未记录详情，请重试连接。' : details,
+            style: const TextStyle(fontSize: 13, height: 1.5),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
 
 class ConnectionsScreen extends StatefulWidget {
   const ConnectionsScreen({super.key, required this.controller});
@@ -71,8 +92,13 @@ class _ConnectionsScreenState extends State<ConnectionsScreen> {
             ),
             IconButton(
               tooltip: '系统应用设置',
+              padding: EdgeInsets.zero,
+              alignment: Alignment.centerRight,
               onPressed: () => invoke('appSettings'),
-              icon: const Icon(Icons.settings_outlined),
+              icon: Transform.translate(
+                offset: const Offset(2, 0),
+                child: const Icon(Icons.settings_outlined),
+              ),
             ),
           ],
         ),
@@ -89,6 +115,15 @@ class _ConnectionsScreenState extends State<ConnectionsScreen> {
                 ? '监听中'
                 : '等待连接',
             healthy: status.connected(source),
+            child:
+                status.notificationAccess &&
+                    !status.listenerConnected &&
+                    status.enabled[source] == true
+                ? TextButton(
+                    onPressed: () => invoke('notificationSettings'),
+                    child: const Text('重新授权连接'),
+                  )
+                : null,
             trailing: Switch(
               value:
                   status.enabled[source] == true && status.notificationAccess,
@@ -159,47 +194,95 @@ class _ConnectionsScreenState extends State<ConnectionsScreen> {
                                 ),
                               ),
                               const SizedBox(height: 4),
-                              Text(
-                                a.error.isNotEmpty
-                                    ? a.error
-                                    : a.lastSync == null
-                                    ? '等待同步'
-                                    : '同步时间：' +
-                                          a.lastSync!
-                                              .toLocal()
-                                              .toString()
-                                              .substring(0, 16),
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: a.error.isEmpty
-                                      ? const Color(0xFF7D8980)
-                                      : const Color(0xFFAD4F39),
+                              if (a.error.isNotEmpty)
+                                TextButton(
+                                  onPressed: () => showMailFailureDetails(
+                                    context,
+                                    a.errorDetails,
+                                  ),
+                                  child: Text(
+                                    '${a.error}\n查看详情',
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: Color(0xFFAD4F39),
+                                    ),
+                                  ),
+                                )
+                              else
+                                Text(
+                                  a.lastSync == null
+                                      ? '等待同步'
+                                      : '同步时间：' +
+                                            a.lastSync!
+                                                .toLocal()
+                                                .toString()
+                                                .substring(0, 16),
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: a.error.isEmpty
+                                        ? const Color(0xFF7D8980)
+                                        : const Color(0xFFAD4F39),
+                                  ),
                                 ),
-                              ),
                             ],
                           ),
                         ),
                         IconButton(
                           tooltip: '移除邮箱',
+                          alignment: Alignment.topCenter,
+                          padding: EdgeInsets.zero,
                           onPressed: () => removeAccount(a),
-                          icon: const Icon(Icons.link_off, size: 20),
+                          icon: const Icon(Icons.delete_outline, size: 20),
                         ),
                       ],
                     ),
                   ),
                 ),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton(
+                Tooltip(
+                  message: '添加${source.label}',
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFFF0F1F0),
+                      foregroundColor: const Color(0xFF7D8980),
+                      minimumSize: const Size(0, 36),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
                     onPressed: () => addAccount(source),
-                    child: const Text('添加邮箱'),
+                    child: Semantics(
+                      label: '添加${source.label}',
+                      child: const Icon(Icons.add, size: 22),
+                    ),
                   ),
                 ),
               ],
             ),
           );
         }),
-        sourceCard(source: MessageSource.gmail, state: '待接入', healthy: false),
+        sourceCard(
+          source: MessageSource.gmail,
+          state: '待接入',
+          healthy: false,
+          child: Tooltip(
+            message: '添加谷歌邮箱',
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFF0F1F0),
+                foregroundColor: const Color(0xFF7D8980),
+                minimumSize: const Size(0, 36),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              onPressed: () => toast('谷歌邮箱授权接入尚未实现'),
+              child: Semantics(
+                label: '添加谷歌邮箱',
+                child: const Icon(Icons.add, size: 22),
+              ),
+            ),
+          ),
+        ),
         const SizedBox(height: 12),
       ],
     );
@@ -333,6 +416,7 @@ class _AccountDialogState extends State<_AccountDialog> {
   final form = GlobalKey<FormState>();
   bool saving = false;
   String? error;
+  String errorDetails = '';
   @override
   void dispose() {
     address.dispose();
@@ -345,6 +429,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     setState(() {
       saving = true;
       error = null;
+      errorDetails = '';
     });
     try {
       await widget.gateway.invoke('saveAccount', {
@@ -357,6 +442,9 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           error = readableError(e);
+          errorDetails = e is PlatformException && e.details is String
+              ? e.details as String
+              : '未获得进一步错误信息，请重试连接。';
           saving = false;
         });
       }
@@ -402,7 +490,7 @@ class _AccountDialogState extends State<_AccountDialog> {
                 TextFormField(
                   controller: secret,
                   enabled: !saving,
-                  obscureText: true,
+                  obscureText: false,
                   autocorrect: false,
                   enableSuggestions: false,
                   decoration: const InputDecoration(
@@ -427,11 +515,17 @@ class _AccountDialogState extends State<_AccountDialog> {
                 if (error != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 14),
-                    child: Text(
-                      error!,
-                      style: const TextStyle(
-                        color: Color(0xFFAD4F39),
-                        fontSize: 12,
+                    child: TextButton(
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        alignment: Alignment.centerLeft,
+                        foregroundColor: const Color(0xFFAD4F39),
+                      ),
+                      onPressed: () =>
+                          showMailFailureDetails(context, errorDetails),
+                      child: Text(
+                        '$error\n查看详情',
+                        style: const TextStyle(fontSize: 12),
                       ),
                     ),
                   ),

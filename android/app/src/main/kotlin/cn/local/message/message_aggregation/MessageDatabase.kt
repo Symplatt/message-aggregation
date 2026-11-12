@@ -129,13 +129,14 @@ class MessageDatabase private constructor(context: Context) : SQLiteOpenHelper(c
 
     // Keep the first persisted ID stable while linking provider and broadcast identities.
     // Details may still be open when the provider row becomes available.
-    @Synchronized fun insertSms(id: String, sender: String, body: String, receivedAt: Long, eventId: String? = null) {
+    @Synchronized fun insertSms(id: String, sender: String, body: String, receivedAt: Long, eventId: String? = null): Boolean {
         val db = writableDatabase
         db.beginTransaction()
         try {
             val providerRecord = resolveId(db, id)
             val eventRecord = eventId?.let { resolveId(db, it) }
             val stableId = providerRecord ?: eventRecord ?: id
+            var changed = false
             if (providerRecord != null && eventRecord != null && providerRecord != eventRecord) {
                 // Older versions could already contain both copies. Retain the latest explicit local choice.
                 db.rawQuery("SELECT isRead, archived, localStateAt, isDeleted FROM messages WHERE id IN (?, ?) " +
@@ -147,8 +148,9 @@ class MessageDatabase private constructor(context: Context) : SQLiteOpenHelper(c
                 }
                 db.execSQL("UPDATE message_aliases SET messageId = ? WHERE messageId = ?", arrayOf(stableId, eventRecord))
                 db.delete("messages", "id = ?", arrayOf(eventRecord))
+                changed = true
             }
-            insert(stableId, "sms", sender.ifBlank { "短信" }, body, sender, receivedAt, sender)
+            changed = insert(stableId, "sms", sender.ifBlank { "短信" }, body, sender, receivedAt, sender) || changed
             db.execSQL("UPDATE messages SET title = '', body = '', sender = '', target = '' WHERE id = ? AND isDeleted = 1", arrayOf(stableId))
             for (alias in listOfNotNull(id, eventId, eventRecord).distinct().filter { it != stableId }) {
                 db.insertWithOnConflict("message_aliases", null, ContentValues().apply {
@@ -156,6 +158,7 @@ class MessageDatabase private constructor(context: Context) : SQLiteOpenHelper(c
                 }, SQLiteDatabase.CONFLICT_REPLACE)
             }
             db.setTransactionSuccessful()
+            return changed
         } finally { db.endTransaction() }
     }
     @Synchronized fun removeAccount(id: String) = writableDatabase.delete("messages", "accountId = ?", arrayOf(id))

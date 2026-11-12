@@ -28,31 +28,37 @@ object SmsSync {
         // Initial import: unread messages from the last seven days; subsequent import: every new inbox row.
         val cutoff = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
         var highest = previous
-        if (previous < 0) {
+        var changed = false
+        try {
+            if (previous < 0) {
+                checkNotNull(context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI,
+                    arrayOf("_id"), null, null, "_id DESC")) { "短信收件箱暂时不可用" }.use {
+                    if (it.moveToFirst()) highest = it.getLong(0)
+                }
+            }
             checkNotNull(context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI,
-                arrayOf("_id"), null, null, "_id DESC")) { "短信收件箱暂时不可用" }.use {
-                if (it.moveToFirst()) highest = it.getLong(0)
+                arrayOf("_id", "address", "body", "date", "read", "date_sent"),
+                if (previous < 0) "date >= ?" else "_id > ? OR date >= ?",
+                if (previous < 0) arrayOf(cutoff.toString()) else arrayOf(previous.toString(), overlap.toString()), "_id ASC")) {
+                "短信收件箱暂时不可用"
+            }.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(0)
+                    highest = maxOf(highest, id)
+                    if (previous < 0 && cursor.getInt(4) != 0) continue
+                    val sender = cursor.getString(1).orEmpty()
+                    val body = cursor.getString(2).orEmpty()
+                    val sentAt = cursor.getLong(5)
+                    changed = MessageDatabase.get(context).insertSms("sms:$id", sender, body, cursor.getLong(3),
+                        sentAt.takeIf { it > 0 }?.let { eventId(sender, it, body) }) || changed
+                }
             }
+            // Do not replay old messages when initially the inbox is empty.
+            check(prefs.edit().putLong("last_id", maxOf(highest, 0)).putLong("last_scan_at", scanStartedAt).commit())
+        } finally {
+            // Earlier rows are already committed even if a later provider read fails.
+            if (changed) BridgeEvents.changed()
         }
-        checkNotNull(context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI,
-            arrayOf("_id", "address", "body", "date", "read", "date_sent"),
-            if (previous < 0) "date >= ?" else "_id > ? OR date >= ?",
-            if (previous < 0) arrayOf(cutoff.toString()) else arrayOf(previous.toString(), overlap.toString()), "_id ASC")) {
-            "短信收件箱暂时不可用"
-        }.use { cursor ->
-            while (cursor.moveToNext()) {
-                val id = cursor.getLong(0)
-                highest = maxOf(highest, id)
-                if (previous < 0 && cursor.getInt(4) != 0) continue
-                val sender = cursor.getString(1).orEmpty()
-                val body = cursor.getString(2).orEmpty()
-                val sentAt = cursor.getLong(5)
-                MessageDatabase.get(context).insertSms("sms:$id", sender, body, cursor.getLong(3),
-                    sentAt.takeIf { it > 0 }?.let { eventId(sender, it, body) })
-            }
-        }
-        // Do not replay old messages when initially the inbox is empty.
-        check(prefs.edit().putLong("last_id", maxOf(highest, 0)).putLong("last_scan_at", scanStartedAt).commit())
     }
 }
 class SmsReceiver : BroadcastReceiver() {
@@ -64,6 +70,7 @@ class SmsReceiver : BroadcastReceiver() {
         val app = context.applicationContext
         val receivedAt = System.currentTimeMillis()
         writer.execute {
+            var changed = false
             try {
                 // Persist the broadcast before depending on a deferred worker or the default app's provider write.
                 synchronized(SmsSync) {
@@ -75,14 +82,14 @@ class SmsReceiver : BroadcastReceiver() {
                             val sentAt = messages.first().timestampMillis
                             val eventId = SmsSync.eventId(sender, sentAt, body)
                             // Persist immediately. Provider-first delivery resolves through the same alias table.
-                            MessageDatabase.get(app).insertSms(eventId, sender, body, receivedAt)
+                            changed = MessageDatabase.get(app).insertSms(eventId, sender, body, receivedAt) || changed
                         }
                     }
                 }
-                BridgeEvents.changed()
             } catch (e: Exception) {
                 Log.w("SmsReceiver", "SMS broadcast persistence failed", e)
             } finally {
+                if (changed) BridgeEvents.changed()
                 try {
                     WorkManager.getInstance(app).enqueue(OneTimeWorkRequestBuilder<SmsWorker>()
                         .setInitialDelay(3, TimeUnit.SECONDS).build())
@@ -94,7 +101,10 @@ class SmsReceiver : BroadcastReceiver() {
     }
 }
 class SmsWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
-    override fun doWork(): Result = try { SmsSync.collect(applicationContext); BridgeEvents.changed(); Result.success() }
+    override fun doWork(): Result = try {
+        SmsSync.collect(applicationContext)
+        Result.success()
+    }
         catch (_: SecurityException) { Result.failure() }
         catch (_: Exception) { Result.retry() }
 }

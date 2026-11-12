@@ -3,6 +3,7 @@ package cn.local.message.message_aggregation
 import android.content.Context
 import androidx.work.*
 import com.sun.mail.imap.IMAPFolder
+import com.sun.mail.imap.IMAPStore
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import javax.mail.*
@@ -23,25 +24,31 @@ object MailSync {
             setProperty("mail.imaps.peek", "true")
         }
         return Session.getInstance(props).getStore("imaps").also { store ->
-            try { store.connect(host, 993, account.address, account.secret) }
-            catch (e: Exception) { runCatching { store.close() }; throw e }
+            var stage = "连接服务器并登录"
+            try {
+                store.connect(host, 993, account.address, account.secret)
+                if (account.provider == "netease") {
+                    stage = "发送客户端标识"
+                    // IMAPFolder.id requires an already-open folder, but NetEase checks ID
+                    // before opening INBOX. Send it on the authenticated store connection.
+                    (store as IMAPStore).id(mapOf("name" to "MessageAggregation", "vendor" to "Symplatt"))
+                }
+            } catch (e: Exception) {
+                runCatching { store.close() }
+                throw MailFailure.from(account, stage, e)
+            }
         }
     }
     private fun openInbox(store: Store, account: MailAccount): IMAPFolder {
-        val folder = store.getFolder("INBOX") as IMAPFolder
-        // NetEase requires a client ID on some accounts.
-        if (account.provider == "netease") runCatching { folder.id(mapOf("name" to "MessageAggregation", "version" to "0.1.0")) }
-        folder.open(Folder.READ_ONLY)
-        return folder
+        try {
+            val folder = store.getFolder("INBOX") as IMAPFolder
+            folder.open(Folder.READ_ONLY)
+            return folder
+        } catch (e: Exception) { throw MailFailure.from(account, "打开收件箱", e) }
     }
     fun validate(account: MailAccount) {
         val store = connect(account)
         try { openInbox(store, account).close(false) } finally { runCatching { store.close() } }
-    }
-    fun friendlyError(error: Exception): String = when (error) {
-        is AuthenticationFailedException -> "登录失败，请检查 IMAP 开关和邮箱授权码"
-        is IllegalArgumentException -> error.message ?: "邮箱配置无效"
-        else -> "连接失败，请检查网络、IMAP 开关及客户端授权设置"
     }
     fun syncAll(context: Context): List<String> = synchronized(lock) {
         val prefs = context.getSharedPreferences("mail_sync", Context.MODE_PRIVATE)
@@ -50,11 +57,12 @@ object MailSync {
             try {
                 syncAccount(context, account)
                 prefs.edit().putLong(account.id + "_success", System.currentTimeMillis())
-                    .remove(account.id + "_error").commit()
+                    .remove(account.id + "_error").remove(account.id + "_error_details").commit()
             } catch (e: Exception) {
-                val message = friendlyError(e)
-                prefs.edit().putString(account.id + "_error", message).commit()
-                errors += account.address + "：" + message
+                val failure = MailFailure.from(account, "同步邮件", e)
+                prefs.edit().putString(account.id + "_error", failure.summary)
+                    .putString(account.id + "_error_details", failure.details).commit()
+                errors += account.address + "：" + failure.summary
             }
         }
         BridgeEvents.changed()

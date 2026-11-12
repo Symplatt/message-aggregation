@@ -118,6 +118,14 @@ List<InboxMessage> filterMessages(
             .toLowerCase();
     return words.every(text.contains);
   }).toList()..sort((a, b) {
+    if (a.isRead != b.isRead) return a.isRead ? 1 : -1;
+    if (!a.isRead) {
+      // Mail providers share one priority so their existing order is preserved.
+      final sourceOrder = a.source.index
+          .clamp(0, 3)
+          .compareTo(b.source.index.clamp(0, 3));
+      if (sourceOrder != 0) return sourceOrder;
+    }
     if (a.isPinned != b.isPinned) return a.isPinned ? -1 : 1;
     return b.receivedAt.compareTo(a.receivedAt);
   });
@@ -129,10 +137,11 @@ class MailAccount {
       address = map['address'] as String,
       provider = MessageSource.values.byName(map['provider'] as String),
       error = map['error'] as String? ?? '',
+      errorDetails = map['errorDetails'] as String? ?? '',
       lastSync = (map['lastSync'] as int? ?? 0) == 0
           ? null
           : DateTime.fromMillisecondsSinceEpoch(map['lastSync'] as int);
-  final String id, address, error;
+  final String id, address, error, errorDetails;
   final MessageSource provider;
   final DateTime? lastSync;
 }

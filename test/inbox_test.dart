@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -33,18 +34,26 @@ class FakeGateway implements AggregationGateway {
   bool failWrites = false;
   bool failNextWrite = false;
   Completer<void>? delayedWrite;
+  int loadCalls = 0;
+  Uint8List? icon;
+  PlatformException? mailFailure;
   @override
   Stream<void> get changes => const Stream.empty();
   @override
-  Future<Map<dynamic, dynamic>> load() async => {
-    'messages': data,
-    'status': <String, dynamic>{},
-  };
+  Future<Map<dynamic, dynamic>> load() async {
+    loadCalls++;
+    return {
+      'messages': data,
+      'status': <String, dynamic>{},
+      if (icon != null) 'icons': {'wechat': Uint8List.fromList(icon!)},
+    };
+  }
   @override
   Future<dynamic> invoke(
     String method, [
     Map<String, dynamic>? arguments,
   ]) async {
+    if (method == 'saveAccount' && mailFailure != null) throw mailFailure!;
     if (method == 'pinMessage') {
       final selected = data.firstWhere((m) => m['id'] == arguments!['id']);
       for (final target in data.where(
@@ -94,12 +103,45 @@ void main() {
       isEmpty,
     );
     expect(filterMessages(messages, query: 'missing'), isEmpty);
+    final ordered = [
+      {...row('read-new', 'wechat', read: true), 'receivedAt': 900},
+      {...row('mail-old', 'gmail'), 'receivedAt': 100},
+      {...row('sms', 'sms'), 'receivedAt': 700},
+      {...row('qq', 'qq'), 'receivedAt': 800},
+      {...row('wechat', 'wechat'), 'receivedAt': 200},
+      {...row('mail-new', 'netease'), 'receivedAt': 600},
+      {...row('mail-middle', 'qqmail'), 'receivedAt': 400},
+      {...row('read-pinned', 'sms', read: true), 'isPinned': true},
+      {...row('read-old', 'qq', read: true), 'receivedAt': 50},
+      {...row('qq-pinned', 'qq'), 'receivedAt': 10, 'isPinned': true},
+    ].map(InboxMessage.fromMap).toList();
+    expect(filterMessages(ordered).map((m) => m.id), [
+      'wechat',
+      'qq-pinned',
+      'qq',
+      'sms',
+      'mail-new',
+      'mail-middle',
+      'mail-old',
+      'read-pinned',
+      'read-new',
+      'read-old',
+    ]);
+    expect(filterMessages(ordered, source: MessageSource.qq).map((m) => m.id), [
+      'qq-pinned',
+      'qq',
+      'read-old',
+    ]);
   });
 
   test('read and archive writes survive controller reload; failed writes leave UI unchanged', () async {
     final gateway = FakeGateway();
+    gateway.icon = Uint8List.fromList([1, 2, 3]);
     final controller = InboxController(gateway);
     await controller.reload();
+    final firstIcon = controller.icons[MessageSource.wechat];
+    final firstConversations = controller.conversations;
+    expect(identical(controller.conversations, firstConversations), isTrue);
     await controller.update(
       controller.messages.first,
       isRead: true,
@@ -108,12 +150,29 @@ void main() {
     await controller.reload();
     expect(controller.messages.first.isRead, isTrue);
     expect(controller.messages.first.archived, isTrue);
+    expect(identical(controller.icons[MessageSource.wechat], firstIcon), isTrue);
+    expect(identical(controller.conversations, firstConversations), isFalse);
+    expect(controller.conversations.first.isRead, isTrue);
     gateway.failWrites = true;
     await expectLater(
       controller.update(controller.messages.first, isRead: false),
       throwsA(isA<PlatformException>()),
     );
     expect(controller.messages.first.isRead, isTrue);
+    final foregroundLoads = gateway.loadCalls;
+    controller.setForeground(false);
+    gateway.data.add(row('background', 'qq'));
+    await controller.reload();
+    await controller.reload();
+    expect(gateway.loadCalls, foregroundLoads);
+    expect(controller.messages.any((m) => m.id == 'background'), isFalse);
+    controller.setForeground(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(gateway.loadCalls, foregroundLoads + 1);
+    expect(controller.messages.any((m) => m.id == 'background'), isTrue);
+    gateway.icon = Uint8List.fromList([4, 5, 6]);
+    await controller.reload();
+    expect(controller.icons[MessageSource.wechat], [4, 5, 6]);
     controller.dispose();
   });
 
@@ -234,6 +293,49 @@ void main() {
       await tester.tap(find.text('接入管理'));
       await tester.pumpAndSettle();
       expect(find.text('未授权'), findsNWidgets(2));
+      final addMail = find.byTooltip('添加QQ 邮箱');
+      await tester.ensureVisible(addMail);
+      await tester.pumpAndSettle();
+      final addButton = find.descendant(
+        of: addMail,
+        matching: find.byType(FilledButton),
+      );
+      expect(tester.getSize(addButton).width, 240);
+      expect(
+        tester.getCenter(
+          find.descendant(of: addButton, matching: find.byIcon(Icons.add)),
+        ),
+        tester.getCenter(addButton),
+      );
+      await tester.tap(addButton);
+      await tester.pumpAndSettle();
+      expect(find.text('添加QQ 邮箱'), findsOneWidget);
+      final fields = find.byType(TextFormField);
+      await tester.enterText(fields.at(0), 'test@qq.com');
+      await tester.enterText(fields.at(1), 'sample-auth-code');
+      final secretInput = tester.widget<EditableText>(
+        find.descendant(of: fields.at(1), matching: find.byType(EditableText)),
+      );
+      expect(secretInput.obscureText, isFalse);
+      gateway.mailFailure = PlatformException(
+        code: 'mail_connection_failed',
+        message: '无法解析邮箱服务器地址（DNS）',
+        details: '失败阶段：连接服务器并登录\n服务器：imap.qq.com:993\nUnknownHostException',
+      );
+      await tester.ensureVisible(find.text('连接邮箱'));
+      await tester.tap(find.text('连接邮箱'));
+      await tester.pumpAndSettle();
+      final detailsButton = find.textContaining('查看详情');
+      await tester.ensureVisible(detailsButton);
+      await tester.tap(detailsButton);
+      await tester.pumpAndSettle();
+      expect(find.text('连接失败详情'), findsOneWidget);
+      expect(find.byType(SelectableText), findsOneWidget);
+      expect(find.textContaining('服务器：imap.qq.com:993'), findsOneWidget);
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
         find.text('谷歌邮箱'),
         400,

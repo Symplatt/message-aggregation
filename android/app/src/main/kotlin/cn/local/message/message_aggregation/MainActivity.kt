@@ -79,11 +79,13 @@ class MainActivity : FlutterActivity() {
             try { val value = action(); runOnUiThread { result.success(value) } }
             catch (e: Exception) {
                 val message = when (e) {
+                    is MailFailure -> e.summary
                     is IllegalArgumentException -> e.message ?: "输入无效"
                     is SecurityException -> "系统未授予所需权限，请在接入管理中检查"
                     else -> "操作未完成，请检查权限、网络或本地存储后重试"
                 }
-                runOnUiThread { result.error("operation_failed", message, null) }
+                runOnUiThread { result.error(if (e is MailFailure) "mail_connection_failed" else "operation_failed",
+                    message, (e as? MailFailure)?.details) }
             }
         }
     }
@@ -91,7 +93,10 @@ class MainActivity : FlutterActivity() {
         try {
             when (call.method) {
                 "load" -> background(result) {
-                    mapOf("messages" to MessageDatabase.get(this).list(), "status" to status(), "icons" to sourceIcons())
+                    val messages = MessageDatabase.get(this).list()
+                    if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+                        Log.d("InboxLoad", "Loaded ${messages.size} rows")
+                    mapOf("messages" to messages, "status" to status(), "icons" to sourceIcons())
                 }
                 "status" -> background(result) { status() }
                 "updateMessage" -> background(result) {
@@ -146,8 +151,7 @@ class MainActivity : FlutterActivity() {
                         require(secret.isNotEmpty()) { "请输入邮箱授权码" }
                         MessageRules.mailHost(provider, address)
                         val account = MailAccount(MessageRules.fingerprint(provider, address), provider, address, secret)
-                        try { MailSync.validate(account) }
-                        catch (e: Exception) { throw IllegalArgumentException(MailSync.friendlyError(e)) }
+                        MailSync.validate(account)
                         AccountStore(this).save(account)
                         MailSync.schedule(this)
                         MailSync.syncAll(this)
@@ -160,7 +164,7 @@ class MainActivity : FlutterActivity() {
                         AccountStore(this).remove(id)
                         MessageDatabase.get(this).removeAccount(id)
                         val editor = getSharedPreferences("mail_sync", MODE_PRIVATE).edit()
-                        listOf("_uid", "_validity", "_success", "_error").forEach { editor.remove(id + it) }
+                        listOf("_uid", "_validity", "_success", "_error", "_error_details").forEach { editor.remove(id + it) }
                         editor.commit()
                         if (AccountStore(this).accounts().isEmpty()) WorkManager.getInstance(this).cancelUniqueWork("mail_sync")
                         null
@@ -215,7 +219,8 @@ class MainActivity : FlutterActivity() {
             // Display metadata never waits for network synchronization or decrypts credentials.
             AccountStore(this).metadata().map { a ->
                 mapOf("id" to a.id, "provider" to a.provider, "address" to a.address,
-                    "lastSync" to sync.getLong(a.id + "_success", 0), "error" to sync.getString(a.id + "_error", "").orEmpty())
+                    "lastSync" to sync.getLong(a.id + "_success", 0), "error" to sync.getString(a.id + "_error", "").orEmpty(),
+                    "errorDetails" to sync.getString(a.id + "_error_details", "").orEmpty())
             }
         }
         return mapOf(

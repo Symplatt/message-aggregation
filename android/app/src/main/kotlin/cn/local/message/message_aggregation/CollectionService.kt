@@ -62,7 +62,7 @@ class CollectionService : Service() {
     private fun collectSms() {
         if (writer.isShutdown || !smsWanted(this) || !collecting.compareAndSet(false, true)) return
         writer.execute {
-            try { SmsSync.collect(this); BridgeEvents.changed() }
+            try { SmsSync.collect(this) }
             catch (e: Exception) { Log.w("SmsSync", "Collector sync failed", e) }
             finally { collecting.set(false) }
         }

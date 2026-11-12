@@ -28,15 +28,30 @@ class AndroidGateway implements AggregationGateway {
 class InboxController extends ChangeNotifier {
   InboxController(this.gateway);
   final AggregationGateway gateway;
-  List<InboxMessage> messages = [];
+  List<InboxMessage> _messages = [];
+  List<InboxMessage>? _conversations;
+  List<InboxMessage> get messages => _messages;
+  set messages(List<InboxMessage> value) {
+    _messages = value;
+    _conversations = null;
+  }
   Map<MessageSource, Uint8List> icons = {};
   ConnectionStatus status = ConnectionStatus();
   bool loading = false, syncing = false;
   String? error;
   StreamSubscription<void>? _events;
   bool _disposed = false, _reloadAgain = false;
+  bool _foreground = true;
   int get unreadCount => messages.where((m) => !m.isRead).length;
-  List<InboxMessage> get conversations => collapseConversations(messages);
+  List<InboxMessage> get conversations =>
+      _conversations ??= collapseConversations(messages);
+
+  void setForeground(bool foreground) {
+    if (_foreground == foreground) return;
+    _foreground = foreground;
+    // Collection continues natively; load the latest state once the UI returns.
+    if (foreground) unawaited(reload());
+  }
 
   void start() {
     _events = gateway.changes.listen(
@@ -54,30 +69,39 @@ class InboxController extends ChangeNotifier {
   }
 
   Future<void> reload() async {
+    if (_disposed || !_foreground) return;
     if (loading) {
       _reloadAgain = true;
       return;
     }
+    _reloadAgain = false;
     loading = true;
     _notify();
     try {
       final data = await gateway.load();
+      if (_disposed || !_foreground) return;
       messages = (data['messages'] as List? ?? [])
           .map((m) => InboxMessage.fromMap(m as Map))
           .toList();
       status = ConnectionStatus(data['status'] as Map? ?? {});
-      icons = {
-        for (final entry in (data['icons'] as Map? ?? {}).entries)
-          MessageSource.values.byName(entry.key as String):
-              entry.value as Uint8List,
-      };
+      final nextIcons = <MessageSource, Uint8List>{};
+      for (final entry in (data['icons'] as Map? ?? {}).entries) {
+        final source = MessageSource.values.byName(entry.key as String);
+        final bytes = entry.value as Uint8List;
+        // MemoryImage keys use buffer identity; reuse unchanged bytes so refreshes
+        // do not leave another decoded copy in Flutter's image cache each time.
+        nextIcons[source] = listEquals(icons[source], bytes)
+            ? icons[source]!
+            : bytes;
+      }
+      icons = nextIcons;
       error = null;
     } catch (e) {
       error = readableError(e);
     } finally {
       loading = false;
       _notify();
-      if (_reloadAgain && !_disposed) {
+      if (_reloadAgain && !_disposed && _foreground) {
         _reloadAgain = false;
         unawaited(reload());
       }

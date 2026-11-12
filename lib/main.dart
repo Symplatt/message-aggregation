@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 
 import 'aggregation_service.dart';
@@ -72,9 +70,7 @@ class _AppHomeState extends State<AppHome> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      unawaited(widget.controller.reload());
-    }
+    widget.controller.setForeground(state == AppLifecycleState.resumed);
   }
 
   @override
